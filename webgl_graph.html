@@ -1,0 +1,360 @@
+<!doctype html>
+<!-- Simple oscilloscope trace plot using WebGL
+     Copyright (c) Jeremy P Bentham 2021. See http://iosoft.blog for details
+     Modified for 8-channel EEG example
+-->
+<html>
+   <body onload=start_graph()>
+      <!-- 8 canvases para 8 canales -->
+      <div id="canvas-container"></div>
+      <button id="single_btn"   onclick="run_single(this)">Single</button>
+      <button id="run_stop_btn" onclick="run_stop(this)"  >Run</button>
+      <select id="sel_nchans" onchange="sel_nchans()"></select>
+      <select id="sel_srce"   onchange="sel_srce()"  ></select>
+      <pre id="status" style="font-size: 14px; margin: 8px"></pre>
+      
+      <style>
+        body { font-family: sans-serif; background-color: #333; color: #eee; }
+        canvas { background-color: #000; margin-bottom: 5px; width: 95%; }
+        button, select { font-size: 16px; margin: 5px; }
+      </style>
+
+      <script>
+        // --- CONSTANTES ---
+        const WEBGL2 = true;
+        const NORM_XMIN=-1.0, NORM_XMAX=1.0, NORM_YMIN=-1.0, NORM_YMAX=1.0;
+        const XMARGIN=20, YMARGIN=90, MIN_CHANS=1, MAX_CHANS=16;
+        const NCHANS = 8; // Número de canales que esperamos
+        
+        // Este es el endpoint de datos que expone el script de Python (Flask)
+        var data_src = "data"; 
+        var sim_srce = "sim"; // No lo usaremos, pero está como referencia
+
+        // --- Variables Globales ---
+        var gl; // Contexto WebGL principal (usado para configuraciones)
+        var canvas; // El primer canvas (para referencia)
+        var clear_colour = [0.1, 0.1, 0.1, 1.0]; // Color de fondo
+        var trace_colours = [[0.6, 0.7, 0.6, 1], // Colores (índice 0 es la grilla)
+            colr(0x00FF00), colr(0xFF0000), colr(0x0000FF), colr(0xFFFF00),
+            colr(0x00FFFF), colr(0xFF00FF), colr(0xFF8000), colr(0xFFFFFF),
+            colr(0x969696), colr(0xffffcc), colr(0x000000), colr(0x800000),
+            colr(0xff0000), colr(0xff9900), colr(0xffff00), colr(0x00ff00)];
+
+        var program, running=false, num_chans = NCHANS;
+        var grid_vertices = []; // Vértices para la grilla (común a todos)
+        var trace_vertices = []; // Array de arrays, uno por canal
+        var all_canvases = []; // Todos los elementos canvas
+        var all_gl_contexts = []; // Todos los contextos WebGL (uno por canvas)
+        var frag_code, vert_code; // Shaders
+
+         // --- Shaders (Sin cambios del original) ---
+         if (WEBGL2)
+            frag_code = `#version 300 es
+                precision mediump float;
+                in vec4 v_colour;
+                out vec4 o_colour;
+                void main() {
+                    o_colour = v_colour;
+                }`;
+        else
+            frag_code = `
+                precision mediump float;
+                varying vec4 v_colour;
+                void main(void) {
+                    gl_FragColor = v_colour;
+                }`;
+
+         if (WEBGL2)
+            vert_code = `#version 300 es
+                in vec3 a_coords;
+                out vec4 v_colour;
+                `;
+        else
+            vert_code = `
+                attribute vec3 a_coords;
+                varying vec4 v_colour;
+                `;
+        vert_code +=
+           `#define MAX_CHANS ${MAX_CHANS}
+            uniform vec4 u_colours[MAX_CHANS];
+            void main(void) {
+               int zint = int(a_coords.z);
+               gl_Position = vec4(a_coords.x, a_coords.y, 0, 1);
+               v_colour = u_colours[zint];
+            }`;
+
+        // --- Funciones de Inicialización ---
+
+        // Inicia todo al cargar la página
+        function start_graph() {
+            var container = elem("canvas-container");
+            // 1. Crear 8 canvases, uno por canal
+            for (var i=0; i < NCHANS; i++) {
+                var new_canvas = document.createElement('canvas');
+                new_canvas.id = "graph_canvas_" + i;
+                new_canvas.width = 1000;
+                new_canvas.height = 100;
+                container.appendChild(new_canvas);
+                all_canvases.push(new_canvas);
+            }
+            canvas = all_canvases[0];
+            
+            // 2. Configurar selectores (dropdowns)
+            var sel = document.getElementById("sel_nchans");
+            for (var n=MIN_CHANS; n<=MAX_CHANS; n++)
+                sel.options.add(new Option(n+" channel"+(n>1?"s":""), value=n));
+            sel.selectedIndex = NCHANS-1;
+            
+            var sel = document.getElementById("sel_srce");
+            sel.options.add(new Option("from Pi (Live)", value=data_src));
+            sel_srce(); // Selecciona "from Pi (Live)" por defecto
+            
+            // 3. Inicializar WebGL para cada canvas
+            try {
+                for (var i=0; i < NCHANS; i++) {
+                    init_graph(all_canvases[i]);
+                }
+            } catch (e) {
+                alert("Error: "+e);
+            }
+            
+            // 4. Configurar programa WebGL (colores, grilla)
+            gl = all_gl_contexts[0];
+            program = gl.program;
+            gl.useProgram(program);
+            
+            var clrs = gl.getUniformLocation(program, 'u_colours');
+            gl.uniform4fv(clrs, new Float32Array(trace_colours.flat()));
+            draw_grid(grid_vertices, 10, 8, 0); // Grilla es (z=0)
+            
+            for (var i=0; i < NCHANS; i++) {
+                trace_vertices.push([]); // Inicializar array de vértices para cada canal
+            }
+            
+            // 5. Configurar eventos y primer dibujado
+            window.addEventListener("resize", resize_canvas);
+            resize_canvas();
+            
+            disp_status(location.host ? "Loaded from "+location.host :
+                        "Loaded from filesystem, no data available");
+            
+            redraw_graph();
+        }
+
+        // Inicializa un contexto WebGL y shaders para un canvas específico
+        function init_graph(canvas_elem) {
+            var local_gl = canvas_elem.getContext(WEBGL2 ? 'webgl2' : 'experimental-webgl');
+            if (!local_gl) { throw "WebGL not supported"; }
+            
+            var vertex_buffer = local_gl.createBuffer();
+            local_gl.bindBuffer(local_gl.ARRAY_BUFFER, vertex_buffer);
+            var frag_shader = compile_shader(local_gl, local_gl.FRAGMENT_SHADER, frag_code);
+            var vert_shader = compile_shader(local_gl, local_gl.VERTEX_SHADER, vert_code);
+            var local_program = local_gl.createProgram();
+            local_gl.attachShader(local_program, vert_shader);
+            local_gl.attachShader(local_program, frag_shader);
+            local_gl.linkProgram(local_program);
+            local_gl.useProgram(local_program);
+            local_gl.bindBuffer(local_gl.ARRAY_BUFFER, vertex_buffer);
+            
+            var coord = local_gl.getAttribLocation(local_program, "a_coords");
+            local_gl.vertexAttribPointer(coord, 3, local_gl.FLOAT, false, 0, 0);
+            local_gl.enableVertexAttribArray(coord);
+
+            local_gl.program = local_program; // Guardar el programa en el contexto
+            all_gl_contexts.push(local_gl); // Guardar el contexto
+        }
+
+        // Compila un shader
+        function compile_shader(gl_ctx, typ, source) {
+            var s = gl_ctx.createShader(typ);
+            gl_ctx.shaderSource(s, source);
+            gl_ctx.compileShader(s);
+            if (!gl_ctx.getShaderParameter(s, gl_ctx.COMPILE_STATUS))
+                throw "Could not compile " +
+                      (typ==gl_ctx.VERTEX_SHADER ? "vertex" : "fragment") +
+                      " shader:\n\n"+gl_ctx.getShaderInfoLog(s);
+            return(s);
+        }
+
+        // --- Funciones de Dibujado ---
+
+        function set_point(vts, x, y, z) { vts.push(x, y, z); }
+        function draw_line(vts, x1, y1, x2, y2, z) { vts.push(x1, y1, z, x2, y2, z); }
+
+        // Parsea los datos y prepara los vértices para CADA canal
+        function draw_traces(vals) {
+            var x, y, zval, np = vals.length / num_chans;
+            
+            for (var chan=0; chan<num_chans; chan++) {
+                trace_vertices[chan] = []; // Limpiar vértices antiguos
+                zval = chan + 1; // z=1 para canal 0, z=2 para canal 1, etc.
+                
+                var vts = trace_vertices[chan];
+                var ymin=1e9, ymax=-1e9;
+                
+                // 1. Auto-escala: encontrar min/max Y para este canal
+                for (var n=0; n<np; n++) {
+                    y = vals[chan + n*num_chans];
+                    if (y < ymin) ymin = y;
+                    if (y > ymax) ymax = y;
+                }
+                var yrange = (ymax - ymin) * 1.1; // Añadir 10% de padding
+                if (yrange < 0.1) yrange = 0.1; // Evitar división por cero
+                var ymid = (ymax + ymin) / 2.0; // Centro del canal
+                
+                // 2. Generar vértices normalizados
+                for (var n=0; n<np; n++) {
+                    if (n > 1)
+                        set_point(vts, x, y, zval); // Añadir punto de unión
+                    
+                    // Normalizar X (de -1 a 1)
+                    x = NORM_XMIN + (NORM_XMAX-NORM_XMIN) * n / (np - 1);
+                    // Normalizar Y (de -1 a 1) basado en el auto-escala
+                    y = (vals[chan + n*num_chans] - ymid) / (yrange / 2.0);
+                    
+                    set_point(vts, x, y, zval);
+                }
+            }
+        }
+
+        // Carga los datos de la grilla y la traza en el buffer de la GPU
+        function redraw_data() {
+            for (var i=0; i < NCHANS; i++) {
+                var gl_ctx = all_gl_contexts[i];
+                gl_ctx.useProgram(gl_ctx.program);
+                
+                var graph_vertices = [];
+                graph_vertices.push(...grid_vertices); // Añadir grilla
+                if (trace_vertices[i]) {
+                    graph_vertices.push(...trace_vertices[i]); // Añadir traza
+                }
+                
+                // Cargar todos los vértices a la GPU
+                gl_ctx.bufferData(gl_ctx.ARRAY_BUFFER, new Float32Array(graph_vertices), gl_ctx.STATIC_DRAW);
+            }
+        }
+
+        // Dibuja la escena en todos los canvases
+        function redraw_graph() {
+            for (var i=0; i < NCHANS; i++) {
+                var gl_ctx = all_gl_contexts[i];
+                var canvas_elem = all_canvases[i];
+                
+                gl_ctx.viewport(0, 0, canvas_elem.width, canvas_elem.height);
+                gl_ctx.clearColor(...clear_colour);
+                gl_ctx.clear(gl_ctx.COLOR_BUFFER_BIT);
+                
+                var num_grid_verts = grid_vertices.length / 3;
+                var num_trace_verts = trace_vertices[i] ? trace_vertices[i].length / 3 : 0;
+                
+                if (num_trace_verts > 0)
+                    gl_ctx.drawArrays(gl_ctx.LINES, 0, num_grid_verts + num_trace_verts);
+            }
+            
+            // Si está corriendo, pedir el siguiente frame
+            if (running)
+                get_data(data_src)
+        }
+
+        // Dibuja la grilla
+        function draw_grid(vts, nx, ny, z) {
+            for (var i=0; i<=nx; i++) {
+                var x = NORM_XMIN + (NORM_XMAX-NORM_XMIN) * i / nx;
+                draw_line(vts, x, NORM_YMIN, x, NORM_YMAX, z);
+            }
+            for (var i=0; i<=ny; i++) {
+                var y = NORM_YMIN + (NORM_YMAX-NORM_YMIN) * i / ny;
+                draw_line(vts, NORM_XMIN, y, NORM_XMAX, y, z);
+            }
+        }
+
+        // --- Lógica de Datos y Eventos ---
+
+        // Pide datos al servidor (Hub de Python)
+        function get_data(fname) {
+            fetch(fname).then((response) => {
+                return response.ok ? response.text() : ""
+            })
+            .then(data => {
+                var vals = csv_decode(data); // Decodificar CSV
+                if (vals.length > 0) {
+                    disp_status(vals.length+" samples (" + vals.length / num_chans + " per chan)");
+                    draw_traces(vals); // Preparar vértices
+                } else {
+                    disp_status("No data");
+                }
+                redraw_data(); // Cargar a GPU
+                redraw_graph(); // Dibujar
+            })
+            .catch(error => {
+                disp_status("Can't load data: " + error);
+                if (running) { // Si falla, reintentar
+                     setTimeout(() => get_data(data_src), 500);
+                }
+            });
+        }
+
+        // Botón 'Single'
+        function run_single(btn) {
+            if (running)
+                run_stop(elem('run_stop_btn'));
+            var vals = get_data(data_src);
+        }
+        // Botón 'Run/Stop'
+        function run_stop(btn) {
+            running = !running;
+            btn.innerText = running ? "Stop" : "Run";
+            if (running)
+                window.requestAnimationFrame(redraw_graph);
+        }
+
+        // --- Funciones Utilitarias ---
+        function disp_status(s) { elem('status').innerHTML = s.trim(); }
+
+        function resize_canvas() {
+            var w = window.innerWidth - XMARGIN;
+            var h = (window.innerHeight - YMARGIN - (NCHANS * 5)) / NCHANS;
+            if (h < 50) h = 50; // Alto mínimo
+            
+            for (var i=0; i < NCHANS; i++) {
+                all_canvases[i].width  = w;
+                all_canvases[i].height = h;
+            }
+            redraw_graph();
+        }
+
+        // Selector de canales (deshabilitado para 8 canales)
+        function sel_nchans() {
+            var sel = document.getElementById("sel_nchans");
+            var new_n = sel.options[sel.selectedIndex].value;
+            if (new_n != num_chans) {
+                alert("This demo is locked to " + NCHANS + " channels.");
+                sel.selectedIndex = NCHANS - 1;
+            }
+        }
+
+        // Selector de fuente de datos
+        function sel_srce() {
+            var sel = elem("sel_srce");
+            data_src = sel.options[sel.selectedIndex].value;
+        }
+
+        // Decodificador de CSV
+        function csv_decode(s) {
+            data = s.trim().split(',');
+            if (data[data.length-1] == "") { data.pop(); } // Quitar última coma
+            return data.map(x => parseFloat(x));
+        }
+
+        // Convertidor de color Hex a RGB normalizado
+        function colr(x) {
+            return([(x>>16&255)/255.0, (x>>8&255)/255.0, (x&255)/255.0, 1.0]);
+        }
+
+        // Acceso rápido a elementos
+        function elem(id) { return document.getElementById(id); }
+
+      </script>
+   </body>
+</html>
