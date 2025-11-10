@@ -23,12 +23,7 @@ DATA_LOCK = threading.Lock()
 # -------------------------------------------------------------------
 # 1. CREACIÓN DE LA APLICACIÓN FLASK
 # -------------------------------------------------------------------
-#
-# !! ESTA ES LA LÍNEA CRÍTICA !!
-# Gunicorn busca esta variable llamada 'app' por defecto.
-# El error "Failed to find attribute 'app'" significa que esta
-# línea faltaba o tenía un nombre diferente (ej. 'mi_app').
-#
+
 app = Flask(__name__)
 
 # -------------------------------------------------------------------
