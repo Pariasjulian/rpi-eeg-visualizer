@@ -1,22 +1,62 @@
 <!doctype html>
-<!-- Simple oscilloscope trace plot using WebGL
+<!-- 
+     Simple oscilloscope trace plot using WebGL
      Copyright (c) Jeremy P Bentham 2021. See http://iosoft.blog for details
      Modified for 8-channel EEG example
+     
+     *** MODIFIED TO USE WEBSOCKET (from java_rpi.html) ***
+     *** MODIFIED TO ADD START/STOP BUTTONS & REMOVE ECHO ***
+     *** MODIFIED to handle 8-channel synchronized (scrolling) data ***
+     *** MODIFIED for EEG: Added labels, light theme, no grid, fixed amplitude ***
+     *** MODIFIED for 9 Channels: 8 EEG (Grey) + 1 Event (Red) ***
 -->
 <html>
    <body onload=start_graph()>
-      <!-- 8 canvases para 8 canales -->
+      <!-- Canvases and labels will be added here dynamically -->
       <div id="canvas-container"></div>
-      <button id="single_btn"   onclick="run_single(this)">Single</button>
-      <button id="run_stop_btn" onclick="run_stop(this)"  >Run</button>
-      <select id="sel_nchans" onchange="sel_nchans()"></select>
-      <select id="sel_srce"   onchange="sel_srce()"  ></select>
+      
+      <!-- UI controls -->
+      <div class="controls-bar">
+         <input type="button" value="Connect" onClick="connect();">
+         <input type="button" value="Disconnect" onClick="disconnect();">
+         <input type="button" value="Start" onClick="send_start();">
+         <input type="button" value="Stop" onClick="send_stop();">
+         <select id="sel_nchans" onchange="sel_nchans()"></select>
+      </div>
       <pre id="status" style="font-size: 14px; margin: 8px"></pre>
       
       <style>
-        body { font-family: sans-serif; background-color: #333; color: #eee; }
-        canvas { background-color: #000; margin-bottom: 5px; width: 95%; }
-        button, select { font-size: 16px; margin: 5px; }
+        body { 
+            font-family: sans-serif; 
+            background-color: #f0f0f0; /* Lighter background */
+            color: #333; /* Darker text */
+        }
+        .controls-bar {
+            margin: 5px;
+        }
+        .channel-wrapper {
+            display: flex;
+            align-items: center;
+            margin-bottom: 3px;
+            width: 98%;
+        }
+        .channel-label {
+            font-size: 14px;
+            font-weight: bold;
+            color: #555;
+            width: 50px; /* Fixed width for alignment */
+            text-align: right;
+            margin-right: 10px;
+        }
+        canvas { 
+            background-color: #ffffff; /* White graph background */
+            border: 1px solid #ccc;
+            flex-grow: 1; /* Canvas takes remaining width */
+        }
+        button, select, input[type=button] { 
+            font-size: 16px; 
+            margin: 5px; 
+        }
       </style>
 
       <script>
@@ -24,28 +64,49 @@
         const WEBGL2 = true;
         const NORM_XMIN=-1.0, NORM_XMAX=1.0, NORM_YMIN=-1.0, NORM_YMAX=1.0;
         const XMARGIN=20, YMARGIN=90, MIN_CHANS=1, MAX_CHANS=16;
-        const NCHANS = 8; // Número de canales que esperamos
         
-        // Este es el endpoint de datos que expone el script de Python (Flask)
-        var data_src = "data"; 
-        var sim_srce = "sim"; // No lo usaremos, pero está como referencia
+        // *** NEW: Total channels is now 9 ***
+        const NCHANS = 9; 
+        const MAX_SAMPLES = 1000; 
 
-        // --- Variables Globales ---
-        var gl; // Contexto WebGL principal (usado para configuraciones)
-        var canvas; // El primer canvas (para referencia)
-        var clear_colour = [0.1, 0.1, 0.1, 1.0]; // Color de fondo
-        var trace_colours = [[0.6, 0.7, 0.6, 1], // Colores (índice 0 es la grilla)
-            colr(0x00FF00), colr(0xFF0000), colr(0x0000FF), colr(0xFFFF00),
-            colr(0x00FFFF), colr(0xFF00FF), colr(0xFF8000), colr(0xFFFFFF),
-            colr(0x969696), colr(0xffffcc), colr(0x000000), colr(0x800000),
-            colr(0xff0000), colr(0xff9900), colr(0xffff00), colr(0x00ff00)];
+        // Fixed amplitude range for EEG (e.g., -100µV to +100µV)
+        const EEG_Y_RANGE_MV = 100.0; 
+        
+        // --- WebSocket Client Vars ---
+        const portnum = 3001;
+        var host, server, websock, connected = false;
 
-        var program, running=false, num_chans = NCHANS;
-        var grid_vertices = []; // Vértices para la grilla (común a todos)
-        var trace_vertices = []; // Array de arrays, uno por canal
-        var all_canvases = []; // Todos los elementos canvas
-        var all_gl_contexts = []; // Todos los contextos WebGL (uno por canvas)
-        var frag_code, vert_code; // Shaders
+        // --- Variables Globales (WebGL) ---
+        var gl; 
+        var canvas; 
+        var clear_colour = [1.0, 1.0, 1.0, 1.0]; // White canvas background
+        
+        // *** NEW: Updated trace colors ***
+        var trace_colours = [
+            [0.9, 0.9, 0.9, 1], // 0: Placeholder (not used)
+            colr(0x333333),     // 1: Dark Grey (for all 8 EEG channels)
+            colr(0xC00000),     // 2: Unused
+            colr(0x0000C0),     // 3: Unused
+            colr(0xB0B000),     // 4: Unused
+            colr(0x00A0A0),     // 5: Unused
+            colr(0xC000C0),     // 6: Unused
+            colr(0xD07000),     // 7: Unused
+            colr(0x333333),     // 8: Unused
+            colr(0xFF0000),     // 9: Bright Red (for Event channel)
+            // ... (remaining colors)
+            colr(0x969696), colr(0xffffcc), colr(0x000000), 
+            colr(0x800000), colr(0xff0000), colr(0xff9900), 
+            colr(0xffff00), colr(0x00ff00)];
+
+        var program, num_chans = NCHANS;
+        
+        // --- Data Storage ---
+        var trace_vertices = []; 
+        var channel_data_buffers = []; 
+
+        var all_canvases = []; 
+        var all_gl_contexts = []; 
+        var frag_code, vert_code; 
 
          // --- Shaders (Sin cambios del original) ---
          if (WEBGL2)
@@ -85,29 +146,40 @@
 
         // --- Funciones de Inicialización ---
 
-        // Inicia todo al cargar la página
         function start_graph() {
             var container = elem("canvas-container");
-            // 1. Crear 8 canvases, uno por canal
+            
+            // 1. Crear 9 canvases, each with a label
             for (var i=0; i < NCHANS; i++) {
+                var wrapper = document.createElement('div');
+                wrapper.className = 'channel-wrapper';
+
+                // *** NEW: Label logic for 9 channels ***
+                var label = document.createElement('span');
+                label.className = 'channel-label';
+                if (i < 8) {
+                    label.innerText = 'CH' + (i + 1); // CH1 - CH8
+                } else {
+                    label.innerText = 'Events'; // 9th channel
+                }
+                wrapper.appendChild(label);
+
                 var new_canvas = document.createElement('canvas');
                 new_canvas.id = "graph_canvas_" + i;
                 new_canvas.width = 1000;
-                new_canvas.height = 100;
-                container.appendChild(new_canvas);
+                new_canvas.height = 100; 
+                wrapper.appendChild(new_canvas);
+
+                container.appendChild(wrapper);
                 all_canvases.push(new_canvas);
             }
             canvas = all_canvases[0];
             
-            // 2. Configurar selectores (dropdowns)
+            // 2. Configurar selector de canales
             var sel = document.getElementById("sel_nchans");
             for (var n=MIN_CHANS; n<=MAX_CHANS; n++)
                 sel.options.add(new Option(n+" channel"+(n>1?"s":""), value=n));
-            sel.selectedIndex = NCHANS-1;
-            
-            var sel = document.getElementById("sel_srce");
-            sel.options.add(new Option("from Pi (Live)", value=data_src));
-            sel_srce(); // Selecciona "from Pi (Live)" por defecto
+            sel.selectedIndex = NCHANS - 1; // Select "9 channels"
             
             // 3. Inicializar WebGL para cada canvas
             try {
@@ -115,28 +187,33 @@
                     init_graph(all_canvases[i]);
                 }
             } catch (e) {
-                alert("Error: "+e);
+                console.error("Error initializing WebGL: " + e);
+                disp_status("Error: " + e);
             }
             
-            // 4. Configurar programa WebGL (colores, grilla)
+            // 4. Configurar programa WebGL (colores)
             gl = all_gl_contexts[0];
             program = gl.program;
             gl.useProgram(program);
             
             var clrs = gl.getUniformLocation(program, 'u_colours');
             gl.uniform4fv(clrs, new Float32Array(trace_colours.flat()));
-            draw_grid(grid_vertices, 10, 8, 0); // Grilla es (z=0)
             
             for (var i=0; i < NCHANS; i++) {
-                trace_vertices.push([]); // Inicializar array de vértices para cada canal
+                // Initialize buffers for each channel
+                trace_vertices.push([]);
+                channel_data_buffers.push([]);
             }
             
             // 5. Configurar eventos y primer dibujado
             window.addEventListener("resize", resize_canvas);
             resize_canvas();
             
-            disp_status(location.host ? "Loaded from "+location.host :
-                        "Loaded from filesystem, no data available");
+            // 6. Inicializar WebSocket
+            host = location.host ? String(location.host) : "localhost";
+            host = host.replace("127.0.0.1", "localhost");
+            server = host.replace(/:\d*\b/, ":" + portnum);
+            disp_status("Host " + host + ". Ready to connect.");
             
             redraw_graph();
         }
@@ -161,8 +238,8 @@
             local_gl.vertexAttribPointer(coord, 3, local_gl.FLOAT, false, 0, 0);
             local_gl.enableVertexAttribArray(coord);
 
-            local_gl.program = local_program; // Guardar el programa en el contexto
-            all_gl_contexts.push(local_gl); // Guardar el contexto
+            local_gl.program = local_program; 
+            all_gl_contexts.push(local_gl);
         }
 
         // Compila un shader
@@ -177,43 +254,144 @@
             return(s);
         }
 
-        // --- Funciones de Dibujado ---
+        // --- WebSocket Functions ---
+
+        function connect() {
+            var url = "ws://" + server + ":3001/";
+            disp_status("Opening websocket " + url + "\n");
+            websock = new WebSocket(url);
+            websock.onopen    = function(evt) {sock_open(evt)};
+            websock.onclose   = function(evt) {sock_close(evt)};
+            websock.onmessage = function(evt) {sock_message(evt)};
+            websock.onerror   = function(evt) {sock_error(evt)};
+            connected = true;
+        }
+        
+        function disconnect() {
+            connected = false;
+            if (websock) websock.close();
+        }
+
+        function sock_message(evt) {
+            var data = evt.data;
+            var vals = csv_decode(data); 
+            
+            // *** NEW: Expects 9 data points ***
+            if (vals.length === num_chans) { 
+                for (var chan = 0; chan < num_chans; chan++) {
+                    let buffer = channel_data_buffers[chan];
+                    buffer.push(vals[chan]);
+                    if (buffer.length > MAX_SAMPLES) {
+                        buffer.shift();
+                    }
+                }
+                
+                let bufferLen = channel_data_buffers[0].length;
+                disp_status(`${vals.length} points rcvd. Buffer: ${bufferLen}/${MAX_SAMPLES}`);
+
+                draw_traces();
+                redraw_data();
+                redraw_graph();
+
+            } else if (vals.length > 0) {
+                disp_status(`Error: Received ${vals.length} data points, expected ${num_chans}.`);
+            } else {
+                disp_status("No data received");
+            }
+        }
+
+        function sock_open(evt) {
+            disp_status("Connected\n");
+        }
+        function sock_close(evt) {
+            disp_status("\nDisconnected\n");
+        }
+        function sock_error(evt) {
+            disp_status("Socket error\n");
+            if (websock) websock.close();
+        }
+
+        // --- Start/Stop Functions ---
+        function send_start() {
+            // *** NEW: Send 'start_9' ***
+            var msg = 'start_9';
+            if (connected && websock) {
+                websock.send(msg);
+                console.log("Sent: " + msg);
+                disp_status("Sent: " + msg);
+            } else {
+                var err = "Not connected. Cannot send 'start_9'.";
+                console.log(err);
+                disp_status(err);
+            }
+        }
+
+        function send_stop() {
+            var msg = 'stop';
+            if (connected && websock) {
+                websock.send(msg);
+                console.log("Sent: " + msg);
+                disp_status("Sent: " + msg);
+            } else {
+                var err = "Not connected. Cannot send 'stop'.";
+                console.log(err);
+                disp_status(err);
+            }
+        }
+
+        // --- Funciones de Dibujado (WebGL) ---
 
         function set_point(vts, x, y, z) { vts.push(x, y, z); }
         function draw_line(vts, x1, y1, x2, y2, z) { vts.push(x1, y1, z, x2, y2, z); }
 
-        // Parsea los datos y prepara los vértices para CADA canal
-        function draw_traces(vals) {
-            var x, y, zval, np = vals.length / num_chans;
-            
-            for (var chan=0; chan<num_chans; chan++) {
-                trace_vertices[chan] = []; // Limpiar vértices antiguos
-                zval = chan + 1; // z=1 para canal 0, z=2 para canal 1, etc.
+        /**
+         * *** MODIFIED: draw_traces ***
+         * Uses fixed amplitude for EEG (ch 0-7) and a
+         * separate fixed amplitude for Events (ch 8).
+         * Sets zval for color: 1=EEG (Grey), 9=Event (Red)
+         */
+        function draw_traces() {
+            var x, y; 
+
+            for (var chan = 0; chan < num_chans; chan++) {
+                trace_vertices[chan] = []; // Clear old vertices
+                let vts = trace_vertices[chan];
+                let buffer = channel_data_buffers[chan];
+                let np = buffer.length; 
                 
-                var vts = trace_vertices[chan];
-                var ymin=1e9, ymax=-1e9;
-                
-                // 1. Auto-escala: encontrar min/max Y para este canal
-                for (var n=0; n<np; n++) {
-                    y = vals[chan + n*num_chans];
-                    if (y < ymin) ymin = y;
-                    if (y > ymax) ymax = y;
+                let zval;
+                let y_mid;
+                let y_range_half;
+
+                if (chan < 8) { // This is an EEG channel (0-7)
+                    zval = 1; // Use color index 1 (Dark Grey)
+                    y_mid = 0.0;
+                    y_range_half = EEG_Y_RANGE_MV; // e.g., 100.0
+                } else { // This is the Event channel (8)
+                    zval = 9; // Use color index 9 (Red)
+                    
+                    // Assuming event data is 0 or 1.
+                    // This centers the line: (0 - 0.5) / 0.5 = -1 (bottom)
+                    //                           (1 - 0.5) / 0.5 = +1 (top)
+                    y_mid = 0.5;
+                    y_range_half = 0.5; 
                 }
-                var yrange = (ymax - ymin) * 1.1; // Añadir 10% de padding
-                if (yrange < 0.1) yrange = 0.1; // Evitar división por cero
-                var ymid = (ymax + ymin) / 2.0; // Centro del canal
                 
-                // 2. Generar vértices normalizados
-                for (var n=0; n<np; n++) {
-                    if (n > 1)
-                        set_point(vts, x, y, zval); // Añadir punto de unión
+                if (np < 2) continue; // Not enough points to draw a line
+                
+                for (var n = 0; n < np; n++) {
+                    if (n > 1) {
+                        set_point(vts, x, y, zval); // Add PREVIOUS point
+                    }
                     
-                    // Normalizar X (de -1 a 1)
-                    x = NORM_XMIN + (NORM_XMAX-NORM_XMIN) * n / (np - 1);
-                    // Normalizar Y (de -1 a 1) basado en el auto-escala
-                    y = (vals[chan + n*num_chans] - ymid) / (yrange / 2.0);
+                    x = NORM_XMIN + (NORM_XMAX - NORM_XMIN) * n / (MAX_SAMPLES - 1);
+                    y = (buffer[n] - y_mid) / y_range_half;
                     
-                    set_point(vts, x, y, zval);
+                    // Clamp values
+                    if (y > 1.0) y = 1.0;
+                    if (y < -1.0) y = -1.0;
+                    
+                    set_point(vts, x, y, zval); // Add CURRENT point
                 }
             }
         }
@@ -225,12 +403,10 @@
                 gl_ctx.useProgram(gl_ctx.program);
                 
                 var graph_vertices = [];
-                graph_vertices.push(...grid_vertices); // Añadir grilla
                 if (trace_vertices[i]) {
-                    graph_vertices.push(...trace_vertices[i]); // Añadir traza
+                    graph_vertices.push(...trace_vertices[i]); 
                 }
                 
-                // Cargar todos los vértices a la GPU
                 gl_ctx.bufferData(gl_ctx.ARRAY_BUFFER, new Float32Array(graph_vertices), gl_ctx.STATIC_DRAW);
             }
         }
@@ -245,105 +421,54 @@
                 gl_ctx.clearColor(...clear_colour);
                 gl_ctx.clear(gl_ctx.COLOR_BUFFER_BIT);
                 
-                var num_grid_verts = grid_vertices.length / 3;
                 var num_trace_verts = trace_vertices[i] ? trace_vertices[i].length / 3 : 0;
                 
                 if (num_trace_verts > 0)
-                    gl_ctx.drawArrays(gl_ctx.LINES, 0, num_grid_verts + num_trace_verts);
-            }
-            
-            // Si está corriendo, pedir el siguiente frame
-            if (running)
-                get_data(data_src)
-        }
-
-        // Dibuja la grilla
-        function draw_grid(vts, nx, ny, z) {
-            for (var i=0; i<=nx; i++) {
-                var x = NORM_XMIN + (NORM_XMAX-NORM_XMIN) * i / nx;
-                draw_line(vts, x, NORM_YMIN, x, NORM_YMAX, z);
-            }
-            for (var i=0; i<=ny; i++) {
-                var y = NORM_YMIN + (NORM_YMAX-NORM_YMIN) * i / ny;
-                draw_line(vts, NORM_XMIN, y, NORM_XMAX, y, z);
+                    gl_ctx.drawArrays(gl_ctx.LINES, 0, num_trace_verts);
             }
         }
-
-        // --- Lógica de Datos y Eventos ---
-
-        // Pide datos al servidor (Hub de Python)
-        function get_data(fname) {
-            fetch(fname).then((response) => {
-                return response.ok ? response.text() : ""
-            })
-            .then(data => {
-                var vals = csv_decode(data); // Decodificar CSV
-                if (vals.length > 0) {
-                    disp_status(vals.length+" samples (" + vals.length / num_chans + " per chan)");
-                    draw_traces(vals); // Preparar vértices
-                } else {
-                    disp_status("No data");
-                }
-                redraw_data(); // Cargar a GPU
-                redraw_graph(); // Dibujar
-            })
-            .catch(error => {
-                disp_status("Can't load data: " + error);
-                if (running) { // Si falla, reintentar
-                     setTimeout(() => get_data(data_src), 500);
-                }
-            });
-        }
-
-        // Botón 'Single'
-        function run_single(btn) {
-            if (running)
-                run_stop(elem('run_stop_btn'));
-            var vals = get_data(data_src);
-        }
-        // Botón 'Run/Stop'
-        function run_stop(btn) {
-            running = !running;
-            btn.innerText = running ? "Stop" : "Run";
-            if (running)
-                window.requestAnimationFrame(redraw_graph);
-        }
-
+        
         // --- Funciones Utilitarias ---
-        function disp_status(s) { elem('status').innerHTML = s.trim(); }
+        function disp_status(s) { 
+            var status_elem = elem('status');
+            status_elem.innerHTML = s.trim();
+            if (status_elem.innerHTML.length > 1000) {
+                 status_elem.innerHTML = s.trim();
+            }
+        }
 
         function resize_canvas() {
-            var w = window.innerWidth - XMARGIN;
-            var h = (window.innerHeight - YMARGIN - (NCHANS * 5)) / NCHANS;
-            if (h < 50) h = 50; // Alto mínimo
+            var w = canvas.clientWidth; 
+            
+            var h = (window.innerHeight - YMARGIN - (NCHANS * 10)) / NCHANS;
+            if (h < 40) h = 40; // Min height
             
             for (var i=0; i < NCHANS; i++) {
                 all_canvases[i].width  = w;
                 all_canvases[i].height = h;
+                all_canvases[i].style.height = h + 'px';
             }
             redraw_graph();
         }
 
-        // Selector de canales (deshabilitado para 8 canales)
+        // Selector de canales
         function sel_nchans() {
             var sel = document.getElementById("sel_nchans");
             var new_n = sel.options[sel.selectedIndex].value;
             if (new_n != num_chans) {
-                alert("This demo is locked to " + NCHANS + " channels.");
+                // *** NEW: Updated message for 9 channels ***
+                var msg = "This demo is locked to " + NCHANS + " channels.";
+                console.log(msg);
+                disp_status(msg);
                 sel.selectedIndex = NCHANS - 1;
             }
-        }
-
-        // Selector de fuente de datos
-        function sel_srce() {
-            var sel = elem("sel_srce");
-            data_src = sel.options[sel.selectedIndex].value;
         }
 
         // Decodificador de CSV
         function csv_decode(s) {
             data = s.trim().split(',');
-            if (data[data.length-1] == "") { data.pop(); } // Quitar última coma
+            if (data.length > 0 && data[data.length-1] == "") { data.pop(); } 
+            if (data.length === 1 && data[0] === "") { return []; }
             return data.map(x => parseFloat(x));
         }
 
