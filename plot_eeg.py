@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 import os
 
 # ================= CONFIGURACIÓN =================
@@ -35,7 +36,7 @@ def check_sync_issues(raw_bytes, packet_size):
     else:
         print(f" [SYNC CHECK] ALERTA: Se detectaron {errors} saltos de sincronización.")
 
-def parse_robust(filename):
+def parse_robust(filename, extract_events=False):
     if not os.path.exists(filename):
         print(f"Error: {filename} no encontrado.")
         return None
@@ -61,15 +62,30 @@ def parse_robust(filename):
     eeg_bytes = packets[:, 3:] # Saltamos los 3 bytes de header
     
     vals = np.zeros((expected_packets, NUM_CHANNELS), dtype=np.float32)
+
+    # Prepare event container when requested
+    events = []  # list of (packet_index, channel_index, code_byte)
     
     for ch in range(NUM_CHANNELS):
         b1 = eeg_bytes[:, 3*ch].astype(np.int32)
         b2 = eeg_bytes[:, 3*ch+1].astype(np.int32)
         b3 = eeg_bytes[:, 3*ch+2].astype(np.int32)
+        # Detect exact marker pattern [nonzero, 0x00, 0x00]
+        if extract_events:
+            mask = (b1 != 0) & (b2 == 0) & (b3 == 0)
+            if np.any(mask):
+                # record events as (packet_index, channel_index, code_byte)
+                idxs = np.nonzero(mask)[0]
+                for i in idxs:
+                    events.append((int(i), int(ch), int(b1[i] & 0xFF)))
+
+        # Reconstruct signed 24-bit value for EEG samples
         val = (b1 << 16) | (b2 << 8) | b3
         val[val >= 0x800000] -= 0x1000000
         vals[:, ch] = val
         
+    if extract_events:
+        return vals, events
     return vals
 
 def simular_eventos(n_muestras):
@@ -91,12 +107,20 @@ def plot_eeg(data):
     data_eventos = simular_eventos(n_muestras)
     # Configuramos subplots: NUM_CHANNELS EEG + 1 canal de eventos
     fig, axes = plt.subplots(NUM_CHANNELS + 1, 1, sharex=True, figsize=(12, 18))
-    fig.suptitle(f'EEG + Canal de Eventos ({duration:.2f}s)', fontsize=16)
+   #fig.suptitle(f'EEG ({NUM_CHANNELS} canales) + Canal de Eventos — {duration:.2f}s', fontsize=16)
 
     # --- Graficar Canales EEG (0 .. NUM_CHANNELS-1) ---
     for i in range(NUM_CHANNELS):
         axes[i].plot(t, data[:, i], lw=0.6, color='#2c3e50')
-        axes[i].set_ylabel(f'Ch {i+1}', rotation=0, labelpad=18, fontsize=8)
+        # Show channel label as CH1, CH2, ... (no amplitude numbers)
+        axes[i].set_ylabel(f'CH{i+1}', rotation=0, labelpad=12, fontsize=8)
+        # Remove numeric y-tick labels (amplitude numbers) for a cleaner look
+        axes[i].set_yticks([])
+        # Disable the automatic scientific multiplier (e.g. 1e6)
+        fmt = ScalarFormatter()
+        fmt.set_scientific(False)
+        fmt.set_useOffset(False)
+        axes[i].yaxis.set_major_formatter(fmt)
         axes[i].grid(True, alpha=0.25)
         axes[i].spines['top'].set_visible(False)
         axes[i].spines['right'].set_visible(False)
@@ -118,5 +142,16 @@ def plot_eeg(data):
     plt.show()
 
 if __name__ == "__main__":
-    data = parse_robust(FILENAME)
+    res = parse_robust(FILENAME, extract_events=True)
+    if res is None:
+        data = None
+        events = []
+    elif isinstance(res, tuple):
+        data, events = res
+    else:
+        data = res
+        events = []
+
+    print(f"Parsed EEG shape: {None if data is None else data.shape}")
+    print(f"Detected events: {len(events)} (first 10) -> {events[:10]}")
     plot_eeg(data)
